@@ -11,14 +11,17 @@ Note:
 import numpy as np
 # import h5py
 import torch
-from model.Model_define_pytorch_office import AutoEncoder, DatasetFolder
+from model.Model_define_pytorch_officeWithCA import AutoEncoder, DatasetFolder
 from model.adversarial import Adversarial
 
 import os
 import torch.nn as nn
-import config.config_ganWithPre as cfg
+# import config.config_officeWithCA as cfg
+import config.config_officeWithCAL2 as cfg
 import utils.CosineAnnealingWithWarmup as LR
 import scipy.io as scio
+from utils.LoadWeight import LoadWeight
+from utils.Loss import l2_regularization
 
 from tensorboardX import SummaryWriter
 
@@ -34,20 +37,21 @@ os.environ["CUDA_VISIBLE_DEVICES"] = cfg.CUDA_VISIBLE_DEVICES
 use_single_gpu = True  # select whether using single gpu or multiple gpus
 # use_single_gpu = False  # select whether using single gpu or multiple gpus
 torch.manual_seed(1)
-batch_size = 128
-epochs = 200
+batch_size = 512
+epochs = 2000
 learning_rate = 1e-3
 num_workers = 4
 print_freq = 10  # print frequency (default: 60)
 # parameters for data
 feedback_bits = 512
 Pretrain = True
+l2_alpha = 0.1
 
 # Model construction
 model = AutoEncoder(feedback_bits)
 if Pretrain:
-    model.encoder.load_state_dict(torch.load(cfg.PRE_ENCODER_PATH)['state_dict'])
-    model.decoder.load_state_dict(torch.load(cfg.PRE_DECODER_PATH)['state_dict'])
+    LoadWeight(model.encoder, cfg.PRE_ENCODER_PATH, excepts=['fc'])
+    LoadWeight(model.decoder, cfg.PRE_DECODER_PATH)
     print("weight loaded")
 if use_single_gpu:
     model = model.cuda()
@@ -93,7 +97,7 @@ cosineLR = LR.LR_Scheduler(optimizer=optimizer,
                            warmup_lr=learning_rate,
                            num_epochs=epochs,
                            base_lr=learning_rate,
-                           final_lr=learning_rate / 100,
+                           final_lr=learning_rate / 1000,
                            iter_per_epoch=1)
 
 for epoch in range(epochs):
@@ -111,12 +115,12 @@ for epoch in range(epochs):
         # compute output
         output = model(input)
         # loss = criterion(output * 128, input * 128)
-        loss = criterion(output * 256, input * 256)
+        loss = criterion(output , input)
 
         # compute gradient and do Adam step
         optimizer.zero_grad()
         loss.backward()
-
+        l2_regularization(model=model, l2_alpha=l2_alpha)
         optimizer.step()
 
         # 用于计算后面的loss平均

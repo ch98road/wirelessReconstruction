@@ -8,14 +8,11 @@ Note:
 [1] C. Wen, W. Shih and S. Jin, "Deep Learning for Massive MIMO CSI Feedback", in IEEE Wireless Communications Letters, vol. 7, no. 5, pp. 748-751, Oct. 2018, doi: 10.1109/LWC.2018.2818160.
     3.The output of the encoder must be the bitstream.
 """
-from json import encoder
-from turtle import forward
 import numpy as np
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-import math
 
 
 # This part implement the quantization and dequantization operations.
@@ -114,65 +111,15 @@ def conv3x3(in_planes, out_planes, stride=1):
                      bias=True)
 
 
-def conv1x1(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes,
-                     out_planes,
-                     kernel_size=1,
-                     stride=stride,
-                     bias=True)
-
-
-class ResBlock(nn.Module):
-    def __init__(self, in_planes, mid_planes, stride=1):
-        super(ResBlock, self).__init__()
-        self.conv1 = conv1x1(in_planes=in_planes,
-                             out_planes=mid_planes,
-                             stride=stride)
-        self.conv2 = conv3x3(in_planes=mid_planes,
-                             out_planes=mid_planes,
-                             stride=stride)
-        self.conv3 = conv1x1(in_planes=mid_planes,
-                             out_planes=in_planes,
-                             stride=stride)
-
-    def forward(self, x):
-        out = F.relu(self.conv1(x))
-        out = F.relu(self.conv2(out))
-        out = F.relu(self.conv3(out))
-        return out + x
-
-
-class ResBlockWithCBAM(nn.Module):
-    def __init__(self, in_planes=2, mid_planes=None, stride=1):
-        super(ResBlockWithCBAM, self).__init__()
-        if mid_planes is None:
-            mid_planes = in_planes * 4
-        self.conv1 = DepthWiseConv(in_ch=in_planes,out_ch=mid_planes)
-        self.conv2 = DepthWiseConv(in_ch=mid_planes,out_ch=mid_planes)
-        self.conv3 = DepthWiseConv(in_ch=mid_planes,out_ch=in_planes)
-                             
-        self.channelAtt = ChannelAttention(in_planes=in_planes)
-        self.spatialAtt = SpatialAttention()
-
-    def forward(self, x):
-        out = F.relu(self.conv1(x))
-        out = F.relu(self.conv2(out))
-        out = F.relu(self.conv3(out))
-        out = self.channelAtt(out) * out
-        out = self.spatialAtt(out) * out
-        return out + x
-
-
 class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
+    def __init__(self, in_planes, ratio=2):
         super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
 
         self.fc = nn.Sequential(
-            nn.Conv2d(in_planes, in_planes // 16, 1, bias=False), nn.ReLU(),
-            nn.Conv2d(in_planes // 16, in_planes, 1, bias=False))
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False), nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False))
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
@@ -182,74 +129,22 @@ class ChannelAttention(nn.Module):
         return self.sigmoid(out)
 
 
-class DepthWiseConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super(DepthWiseConv, self).__init__()
-        # 也相当于分组为1的分组卷积
-        self.depth_conv = nn.Conv2d(in_channels=in_ch,
-                                    out_channels=in_ch,
-                                    kernel_size=3,
-                                    stride=1,
-                                    padding=1,
-                                    groups=in_ch)
-        self.point_conv = nn.Conv2d(in_channels=in_ch,
-                                    out_channels=out_ch,
-                                    kernel_size=1,
-                                    stride=1,
-                                    padding=0,
-                                    groups=1)
-
-    def forward(self, input):
-        out = self.depth_conv(input)
-        out = self.point_conv(out)
-        return out
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-
-        self.conv1 = nn.Conv2d(2,
-                               1,
-                               kernel_size,
-                               padding=kernel_size // 2,
-                               bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
 class Encoder(nn.Module):
     B = 4
 
     def __init__(self, feedback_bits):
         super(Encoder, self).__init__()
-        self.first_conv = DepthWiseConv(2, 2)
-        self.conv1 = DepthWiseConv(2, 16)
-        self.res1 = ResBlockWithCBAM(16, 16)
-        self.conv2 = DepthWiseConv(16, 32)
-        self.res2 = ResBlockWithCBAM(32, 32)
-        self.res3 = ResBlockWithCBAM(32, 32)
-        self.conv3 = DepthWiseConv(32, 2)
+        self.conv1 = conv3x3(2, 2)
+        self.conv2 = conv3x3(2, 2)
+        self.ca = ChannelAttention(in_planes=2, ratio=2)
         self.fc = nn.Linear(32256, int(feedback_bits // self.B))
         self.sig = nn.Sigmoid()
         self.quantize = QuantizationLayer(self.B)
 
     def forward(self, x):
-        first_out = F.relu(self.first_conv(x))
-
-        out = F.relu(self.conv1(first_out))
-        res = self.res1(out) + out
-        out = F.relu(self.conv2(res))
-        res = self.res2(out) + out
-        res = self.res3(res) + res + out
-        out = F.relu(self.conv3(res)) + first_out
-
+        out = F.relu(self.conv1(x))
+        out = F.relu(self.conv2(out))
+        out = self.ca(out) * out
         out = out.view(-1, 32256)
         out = self.fc(out)
         out = self.sig(out)
@@ -263,72 +158,31 @@ class Decoder(nn.Module):
 
     def __init__(self, feedback_bits):
         super(Decoder, self).__init__()
-
         self.feedback_bits = feedback_bits
         self.dequantize = DequantizationLayer(self.B)
-
-        self.layers = [[2, 16], [16, 64], [64, 16]]
-
         self.multiConvs = nn.ModuleList()
-        self.after_conv = DepthWiseConv(in_ch=self.layers[-1][1], out_ch=2)
-
         self.fc = nn.Linear(int(feedback_bits // self.B), 32256)
-        self.out_cov = DepthWiseConv(2, 2)
+        self.out_cov = conv3x3(2, 2)
         self.sig = nn.Sigmoid()
 
-        for layer in self.layers:
+        for _ in range(3):
             self.multiConvs.append(
-                nn.Sequential(conv1x1(layer[0], layer[1]),
-                              ResBlockWithCBAM(in_planes=layer[1])))
+                nn.Sequential(conv3x3(2, 8), nn.ReLU(), conv3x3(8, 16),
+                              nn.ReLU(), conv3x3(16, 2), nn.ReLU()))
 
     def forward(self, x):
         out = self.dequantize(x)
         out = out.view(-1, int(self.feedback_bits // self.B))
         out = self.sig(self.fc(out))
         out = out.view(-1, 2, 126, 128)
-        # for i in range(3):
-        #     residual = out
-        #     out = self.multiConvs[i](out)
-        #     out = residual + out
+        for i in range(3):
+            residual = out
+            out = self.multiConvs[i](out)
+            out = residual + out
 
-        for index in range(len(self.layers)):
-            out = self.multiConvs[index](out)
-        out = F.relu(self.after_conv(out))
         out = self.out_cov(out)
         out = self.sig(out)
         return out
-
-
-# class Decoder(nn.Module):
-#     B = 4
-
-#     def __init__(self, feedback_bits):
-#         super(Decoder, self).__init__()
-#         self.feedback_bits = feedback_bits
-#         self.dequantize = DequantizationLayer(self.B)
-#         self.multiConvs = nn.ModuleList()
-#         self.fc = nn.Linear(int(feedback_bits // self.B), 32256)
-#         self.out_cov = conv3x3(2, 2)
-#         self.sig = nn.Sigmoid()
-
-#         for _ in range(3):
-#             self.multiConvs.append(
-#                 nn.Sequential(conv3x3(2, 8), nn.ReLU(), conv3x3(8, 16),
-#                               nn.ReLU(), conv3x3(16, 2), nn.ReLU()))
-
-#     def forward(self, x):
-#         out = self.dequantize(x)
-#         out = out.view(-1, int(self.feedback_bits // self.B))
-#         out = self.sig(self.fc(out))
-#         out = out.view(-1, 2, 126, 128)
-#         for i in range(3):
-#             residual = out
-#             out = self.multiConvs[i](out)
-#             out = residual + out
-
-#         out = self.out_cov(out)
-#         out = self.sig(out)
-#         return out
 
 
 # Note: Do not modify following class and keep it in your submission.
@@ -346,12 +200,10 @@ class AutoEncoder(nn.Module):
 
 
 def NMSE(x, x_hat):
-    # 第四维的数，这一维度是channel，因此这里就是根据channel来区分两个层的数据
     x_real = np.reshape(x[:, :, :, 0], (len(x), -1))
     x_imag = np.reshape(x[:, :, :, 1], (len(x), -1))
     x_hat_real = np.reshape(x_hat[:, :, :, 0], (len(x_hat), -1))
     x_hat_imag = np.reshape(x_hat[:, :, :, 1], (len(x_hat), -1))
-    # 1j是虚数的意思
     x_C = x_real - 0.5 + 1j * (x_imag - 0.5)
     x_hat_C = x_hat_real - 0.5 + 1j * (x_hat_imag - 0.5)
     power = np.sum(abs(x_C)**2, axis=1)
@@ -375,7 +227,3 @@ class DatasetFolder(Dataset):
 
     def __len__(self):
         return self.matdata.shape[0]
-
-
-if __name__ == '__main__':
-    encoder = Encoder(feedback_bits=512)

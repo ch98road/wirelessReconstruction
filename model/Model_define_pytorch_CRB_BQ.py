@@ -13,6 +13,27 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from torch import einsum
+from collections import OrderedDict
+
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=2):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False), nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False))
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
 
 # This part implement the quantization and dequantization operations.
@@ -23,8 +44,8 @@ def Num2Bit(Num, B):
     def integer2bit(integer, num_bits=B * 2):
         dtype = integer.type()
         exponent_bits = -torch.arange(-(num_bits - 1), 1).type(dtype)
-        exponent_bits = exponent_bits.repeat(integer.shape + (1,))
-        out = integer.unsqueeze(-1) // 2 ** exponent_bits
+        exponent_bits = exponent_bits.repeat(integer.shape + (1, ))
+        out = integer.unsqueeze(-1) // 2**exponent_bits
         return (out - (out % 1)) % 2
 
     bit = integer2bit(Num_)
@@ -37,7 +58,7 @@ def Bit2Num(Bit, B):
     Bit_ = torch.reshape(Bit_, [-1, int(Bit_.shape[1] / B), B])
     num = torch.zeros(Bit_[:, :, 1].shape).cuda()
     for i in range(B):
-        num = num + Bit_[:, :, i] * 2 ** (B - 1 - i)
+        num = num + Bit_[:, :, i] * 2**(B - 1 - i)
     return num
 
 
@@ -45,7 +66,7 @@ class Quantization(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, B):
         ctx.constant = B
-        step = 2 ** B
+        step = 2**B
         out = torch.round(x * step - 0.5)
         out = Num2Bit(out, B)
         return out
@@ -56,8 +77,8 @@ class Quantization(torch.autograd.Function):
         # Gradients of constant arguments to forward must be None.
         # Gradient of a number is the sum of its B bits.
         b, _ = grad_output.shape
-        grad_num = torch.sum(grad_output.reshape(
-            b, -1, ctx.constant), dim=2) / ctx.constant
+        grad_num = torch.sum(grad_output.reshape(b, -1, ctx.constant),
+                             dim=2) / ctx.constant
         return grad_num, None
 
 
@@ -65,7 +86,7 @@ class Dequantization(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, B):
         ctx.constant = B
-        step = 2 ** B
+        step = 2**B
         out = Bit2Num(x, B)
         out = (out + 0.5) / step
         return out
@@ -82,7 +103,6 @@ class Dequantization(torch.autograd.Function):
 
 
 class QuantizationLayer(nn.Module):
-
     def __init__(self, B):
         super(QuantizationLayer, self).__init__()
         self.B = B
@@ -93,7 +113,6 @@ class QuantizationLayer(nn.Module):
 
 
 class DequantizationLayer(nn.Module):
-
     def __init__(self, B):
         super(DequantizationLayer, self).__init__()
         self.B = B
@@ -105,81 +124,149 @@ class DequantizationLayer(nn.Module):
 
 def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=True)
+    return nn.Conv2d(in_planes,
+                     out_planes,
+                     kernel_size=3,
+                     stride=stride,
+                     padding=1,
+                     bias=True)
+
+
+class ConvBN(nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, groups=1):
+        if not isinstance(kernel_size, int):
+            padding = [(i - 1) // 2 for i in kernel_size]
+        else:
+            padding = (kernel_size - 1) // 2
+        super(ConvBN, self).__init__(OrderedDict([
+            ('conv', nn.Conv2d(in_planes, out_planes, kernel_size, stride,
+                               padding=padding, groups=groups, bias=False)),
+            ('bn', nn.BatchNorm2d(out_planes))
+        ]))
+
+
+class CRBlock(nn.Module):
+    def __init__(self, in_planes=16, mid_planes=128):
+        super(CRBlock, self).__init__()
+        self.path1 = nn.Sequential(OrderedDict([
+            ('conv3x3', ConvBN(in_planes, mid_planes, 3)),
+            ('relu1', nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ('conv1x9', ConvBN(mid_planes, mid_planes, [1, 9])),
+            ('relu2', nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ('conv9x1', ConvBN(mid_planes, mid_planes, [9, 1])),
+        ]))
+        self.path2 = nn.Sequential(OrderedDict([
+            ('conv1x5', ConvBN(in_planes, mid_planes, [1, 5])),
+            ('relu', nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ('conv5x1', ConvBN(mid_planes, mid_planes, [5, 1])),
+        ]))
+        
+        self.conv1x1 = ConvBN(mid_planes * 2, in_planes, 1)
+        self.identity = nn.Identity()
+        self.relu = nn.LeakyReLU(negative_slope=0.3, inplace=True)
+
+    def forward(self, x):
+        identity = self.identity(x)
+
+        out1 = self.path1(x)
+        out2 = self.path2(x)
+        out = torch.cat((out1, out2), dim=1)
+        out = self.relu(out)
+        out = self.conv1x1(out)
+
+        out = self.relu(out + identity)
+        return out
 
 
 class Encoder(nn.Module):
     B = 4
 
-    def __init__(self, feedback_bits):
+    def __init__(self, feedback_bits, quantization=True):
         super(Encoder, self).__init__()
+        self.padding = None
         self.conv1 = conv3x3(2, 2)
-        self.conv2 = conv3x3(2, 2)
+        self.encoder1 = nn.Sequential(OrderedDict([
+            ("conv3x3_bn", ConvBN(2, 64, 3)),
+            ("relu1", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ("conv1x7_bn", ConvBN(64, 64, [1, 7])),
+            ("relu2", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ("conv7x1_bn", ConvBN(64, 64, [7, 1])),
+        ]))
+        self.encoder2 = ConvBN(2, 64, 3)
+        self.encoder_conv = nn.Sequential(OrderedDict([
+            ("relu1", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ("conv1x1_bn", ConvBN(64*2, 2, 1)),
+            ("relu2", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+        ]))
+
+        # self.ca = ChannelAttention(in_planes=2, ratio=1)
+
         self.fc = nn.Linear(32256, int(feedback_bits // self.B))
         self.sig = nn.Sigmoid()
         self.quantize = QuantizationLayer(self.B)
-        self.mean = 0.50001776
-        self.std = 0.014204533
+        self.quantization = quantization
 
     def forward(self, x):
-        x = (x - self.mean)/self.std
-        out = F.relu(self.conv1(x))
-        out = F.relu(self.conv2(out))
+
+        # conv
+        conv1_out = F.relu(self.conv1(x))
+
+        encode1 = self.encoder1(conv1_out)
+        encode2 = self.encoder2(conv1_out)
+
+        out = torch.cat((encode1, encode2), dim=1)
+        out = self.encoder_conv(out)
         out = out.view(-1, 32256)
         out = self.fc(out)
         out = self.sig(out)
-        out = self.quantize(out)
-
+        if self.quantization:
+            out = self.quantize(out)
         return out
 
 
 class Decoder(nn.Module):
     B = 4
 
-    def __init__(self, feedback_bits):
+    def __init__(self, feedback_bits, quantization=True):
         super(Decoder, self).__init__()
         self.feedback_bits = feedback_bits
         self.dequantize = DequantizationLayer(self.B)
-        self.multiConvs = nn.ModuleList()
-        self.fc = nn.Linear(int(feedback_bits // self.B), 32256)
-        self.out_cov = conv3x3(2, 2)
-        self.sig = nn.Sigmoid()
 
-        self.mean = 0.50001776
-        self.std = 0.014204533
-        for _ in range(3):
-            self.multiConvs.append(nn.Sequential(
-                conv3x3(2, 8),
-                nn.ReLU(),
-                conv3x3(8, 16),
-                nn.ReLU(),
-                conv3x3(16, 2),
-                nn.ReLU()))
+        self.fc = nn.Linear(int(feedback_bits // self.B), 32256)
+
+        decoder = OrderedDict([
+            ("conv5x5_bn", ConvBN(2, 16, 5)),
+            ("relu", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+            ("CRBlock1", CRBlock(in_planes=16, mid_planes=128)),
+            ("CRBlock2", CRBlock(in_planes=16, mid_planes=128)),
+            ("CRBlock3", CRBlock(in_planes=16, mid_planes=128)),
+            # ("CRBlock4", CRBlock(in_planes=16, mid_planes=128)),
+            # ("CRBlock5", CRBlock(in_planes=16, mid_planes=128)),
+            # ("CRBlock6", CRBlock(in_planes=16, mid_planes=128)),
+        ])
+        self.decoder_feature = nn.Sequential(decoder)
+        self.out_cov = conv3x3(16, 2)
+        self.sig = nn.Sigmoid()
+        self.quantization = quantization
 
     def forward(self, x):
-        out = self.dequantize(x)
+        if self.quantization:
+            out = self.dequantize(x)
+        else:
+            out = x
         out = out.view(-1, int(self.feedback_bits // self.B))
-        # out = self.sig(self.fc(out))
         out = self.fc(out)
         out = out.view(-1, 2, 126, 128)
-        for i in range(3):
-            residual = out
-            out = self.multiConvs[i](out)
-            out = residual + out
-        # out = self.sig(out)
-        
+        out = self.decoder_feature(out)
         out = self.out_cov(out)
-        # out = self.sig(out)
 
-        out = out*self.std + self.mean
+        out = self.sig(out)
         return out
 
 
 # Note: Do not modify following class and keep it in your submission.
 # feedback_bits is 512 by default.
 class AutoEncoder(nn.Module):
-
     def __init__(self, feedback_bits):
         super(AutoEncoder, self).__init__()
         self.encoder = Encoder(feedback_bits)
@@ -198,8 +285,8 @@ def NMSE(x, x_hat):
     x_hat_imag = np.reshape(x_hat[:, :, :, 1], (len(x_hat), -1))
     x_C = x_real - 0.5 + 1j * (x_imag - 0.5)
     x_hat_C = x_hat_real - 0.5 + 1j * (x_hat_imag - 0.5)
-    power = np.sum(abs(x_C) ** 2, axis=1)
-    mse = np.sum(abs(x_C - x_hat_C) ** 2, axis=1)
+    power = np.sum(abs(x_C)**2, axis=1)
+    mse = np.sum(abs(x_C - x_hat_C)**2, axis=1)
     nmse = np.mean(mse / power)
     return nmse
 
@@ -211,7 +298,6 @@ def Score(NMSE):
 
 # dataLoader
 class DatasetFolder(Dataset):
-
     def __init__(self, matData):
         self.matdata = matData
 

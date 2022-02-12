@@ -56,8 +56,7 @@ class Quantization(torch.autograd.Function):
         # Gradients of constant arguments to forward must be None.
         # Gradient of a number is the sum of its B bits.
         b, _ = grad_output.shape
-        grad_num = torch.sum(grad_output.reshape(
-            b, -1, ctx.constant), dim=2) / ctx.constant
+        grad_num = torch.sum(grad_output.reshape(b, -1, ctx.constant), dim=2) / ctx.constant
         return grad_num, None
 
 
@@ -119,11 +118,8 @@ class Encoder(nn.Module):
         self.fc = nn.Linear(32256, int(feedback_bits // self.B))
         self.sig = nn.Sigmoid()
         self.quantize = QuantizationLayer(self.B)
-        self.mean = 0.50001776
-        self.std = 0.014204533
 
     def forward(self, x):
-        x = (x - self.mean)/self.std
         out = F.relu(self.conv1(x))
         out = F.relu(self.conv2(out))
         out = out.view(-1, 32256)
@@ -146,8 +142,6 @@ class Decoder(nn.Module):
         self.out_cov = conv3x3(2, 2)
         self.sig = nn.Sigmoid()
 
-        self.mean = 0.50001776
-        self.std = 0.014204533
         for _ in range(3):
             self.multiConvs.append(nn.Sequential(
                 conv3x3(2, 8),
@@ -160,19 +154,15 @@ class Decoder(nn.Module):
     def forward(self, x):
         out = self.dequantize(x)
         out = out.view(-1, int(self.feedback_bits // self.B))
-        # out = self.sig(self.fc(out))
-        out = self.fc(out)
+        out = self.sig(self.fc(out))
         out = out.view(-1, 2, 126, 128)
         for i in range(3):
             residual = out
             out = self.multiConvs[i](out)
             out = residual + out
-        # out = self.sig(out)
-        
-        out = self.out_cov(out)
-        # out = self.sig(out)
 
-        out = out*self.std + self.mean
+        out = self.out_cov(out)
+        out = self.sig(out)
         return out
 
 
